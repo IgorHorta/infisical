@@ -81,6 +81,7 @@ import { oidcConfigDALFactory } from "@app/ee/services/oidc/oidc-config-dal";
 import { oidcConfigServiceFactory } from "@app/ee/services/oidc/oidc-config-service";
 import { pamAccountDALFactory } from "@app/ee/services/pam-account/pam-account-dal";
 import { pamAccountServiceFactory } from "@app/ee/services/pam-account/pam-account-service";
+import { pamTerminalServiceFactory } from "@app/ee/services/pam-account/pam-terminal-service";
 import { pamFolderDALFactory } from "@app/ee/services/pam-folder/pam-folder-dal";
 import { pamFolderServiceFactory } from "@app/ee/services/pam-folder/pam-folder-service";
 import { pamResourceDALFactory } from "@app/ee/services/pam-resource/pam-resource-dal";
@@ -2510,6 +2511,20 @@ export const registerRoutes = async (
     kmsService
   });
 
+  const pamTerminalService = pamTerminalServiceFactory({
+    pamSessionDAL,
+    pamAccountDAL,
+    pamResourceDAL,
+    pamSessionService: {
+      getById: pamSessionService.getById,
+      appendLogsForUser: pamSessionService.appendLogsForUser,
+      endSessionById: pamSessionService.endSessionById
+    },
+    auditLogService,
+    kmsService,
+    gatewayV2Service
+  });
+
   const aiMcpServerService = aiMcpServerServiceFactory({
     aiMcpServerDAL,
     aiMcpServerToolDAL,
@@ -2745,8 +2760,15 @@ export const registerRoutes = async (
     pamResource: pamResourceService,
     pamAccount: pamAccountService,
     pamSession: pamSessionService,
+    pamTerminal: pamTerminalService,
     mfaSession: mfaSessionService,
     upgradePath: upgradePathService,
+    // Services needed for direct access (e.g., WebSocket handlers)
+    kmsService,
+    // DALs - exposed for direct database access when needed
+    pamAccountDAL,
+    pamResourceDAL,
+    pamSessionDAL,
 
     membershipUser: membershipUserService,
     membershipIdentity: membershipIdentityService,

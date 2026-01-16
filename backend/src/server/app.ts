@@ -12,6 +12,7 @@ import type { FastifyRateLimitOptions } from "@fastify/rate-limit";
 import ratelimiter from "@fastify/rate-limit";
 import { fastifyRequestContext } from "@fastify/request-context";
 import fastify from "fastify";
+import websocket from "@fastify/websocket";
 import { Cluster, Redis } from "ioredis";
 import { Knex } from "knex";
 
@@ -137,6 +138,8 @@ export const main = async ({
     await server.register(helmet, { contentSecurityPolicy: false });
 
     await server.register(maintenanceMode);
+
+    await server.register(websocket);
 
     await server.register(fastifyRequestContext, {
       defaultStoreValues: (req) => ({
