@@ -38,6 +38,8 @@ const TERMINAL_THEME = {
 };
 
 const RECONNECT_DELAY_MS = 3000;
+const MAX_RECONNECT_ATTEMPTS = 3;
+const DEFAULT_PROMPT = "postgres=# ";
 
 const getToken = () =>
   getAuthToken() || getSignupTempToken() || getMfaTempToken() || SecurityClient.getProviderAuthToken() || "";
@@ -53,12 +55,14 @@ export const PostgreSQLTerminal = ({ accountId, sessionId }: Props) => {
   const terminalInstanceRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const promptRef = useRef<string>(DEFAULT_PROMPT);
+  const reconnectAttemptsRef = useRef<number>(0);
   const [commandHistory, setCommandHistory] = useState<string[]>([]);
 
   const showPrompt = useCallback(() => {
     const terminal = terminalInstanceRef.current;
     if (!terminal) return;
-    terminal.write("\r\npostgres=# ");
+    terminal.write(`\r\n${promptRef.current}`);
     terminal.focus();
   }, []);
 
@@ -107,6 +111,7 @@ export const PostgreSQLTerminal = ({ accountId, sessionId }: Props) => {
           output?: string;
           executionTime?: number;
           message?: string;
+          database?: string;
         };
 
         if (data.error) {
@@ -139,6 +144,10 @@ export const PostgreSQLTerminal = ({ accountId, sessionId }: Props) => {
           terminal.writeln(data.message || "Connection closed");
           wsRef.current?.close();
         } else if (data.type === "connected") {
+          // Update prompt with actual database name
+          if (data.database) {
+            promptRef.current = `${data.database}=# `;
+          }
           terminal.writeln(data.message || "Connected to database");
           showPrompt();
         } else {
@@ -155,16 +164,26 @@ export const PostgreSQLTerminal = ({ accountId, sessionId }: Props) => {
     };
 
     const handleClose = (event: CloseEvent) => {
-      if (event.wasClean) {
+      // Don't reconnect for clean closes or policy violations (auth failures, session expired)
+      if (event.wasClean || event.code === 1008) {
         terminal.writeln("Connection closed");
         return;
       }
 
-      terminal.writeln("Connection lost - reconnecting...");
+      // Check reconnect attempts
+      if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
+        terminal.writeln("Max reconnection attempts reached. Please refresh the page.");
+        return;
+      }
+
+      reconnectAttemptsRef.current += 1;
+      terminal.writeln(`Connection lost - reconnecting (attempt ${reconnectAttemptsRef.current}/${MAX_RECONNECT_ATTEMPTS})...`);
+
       setTimeout(() => {
         if (!wsRef.current || wsRef.current.readyState === WebSocket.CLOSED) {
           const newWs = new WebSocket(buildWsUrl(accountId, sessionId, getToken()));
           newWs.onopen = () => {
+            reconnectAttemptsRef.current = 0; // Reset on successful connection
             terminal.writeln("Reconnected to terminal server.");
             showPrompt();
           };
@@ -259,7 +278,8 @@ export const PostgreSQLTerminal = ({ accountId, sessionId }: Props) => {
         if (newIndex >= 0 && newIndex < commandHistory.length) {
           historyIndex = newIndex;
           const cmd = commandHistory[commandHistory.length - 1 - newIndex];
-          terminal.write(`\r${" ".repeat(currentLine.length + 12)}\rpostgres=# ${cmd}`);
+          const clearLength = currentLine.length + promptRef.current.length;
+          terminal.write(`\r${" ".repeat(clearLength)}\r${promptRef.current}${cmd}`);
           currentLine = cmd;
         }
         return;
@@ -267,14 +287,15 @@ export const PostgreSQLTerminal = ({ accountId, sessionId }: Props) => {
 
       // Down arrow - navigate history
       if (data === "\x1b[B") {
+        const clearLength = currentLine.length + promptRef.current.length;
         if (historyIndex > 0) {
           historyIndex -= 1;
           const cmd = commandHistory[commandHistory.length - 1 - historyIndex];
-          terminal.write(`\r${" ".repeat(currentLine.length + 12)}\rpostgres=# ${cmd || ""}`);
+          terminal.write(`\r${" ".repeat(clearLength)}\r${promptRef.current}${cmd || ""}`);
           currentLine = cmd || "";
         } else if (historyIndex === 0) {
           historyIndex = -1;
-          terminal.write(`\r${" ".repeat(currentLine.length + 12)}\rpostgres=# `);
+          terminal.write(`\r${" ".repeat(clearLength)}\r${promptRef.current}`);
           currentLine = "";
         }
         return;

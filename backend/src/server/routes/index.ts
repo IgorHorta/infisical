@@ -2512,7 +2512,6 @@ export const registerRoutes = async (
   });
 
   const pamTerminalService = pamTerminalServiceFactory({
-    pamSessionDAL,
     pamAccountDAL,
     pamResourceDAL,
     pamSessionService: {

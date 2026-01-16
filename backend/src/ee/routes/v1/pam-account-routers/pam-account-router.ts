@@ -43,8 +43,17 @@ const ListPamAccountsResponseSchema = z.object({
 const INCREMENTAL_SAVE_BATCH_SIZE = 10;
 const INCREMENTAL_SAVE_INTERVAL_MS = 30000;
 const MAX_RETRY_ATTEMPTS = 3;
-const INITIAL_RETRY_DELAY_MS = 180000; // 3 minutes
+const INITIAL_RETRY_DELAY_MS = 1000; // 1 second
 const MAX_COMMAND_LENGTH = 10000;
+
+// Safe JSON stringify that handles circular references and non-serializable data
+const safeStringify = (obj: unknown): string => {
+  try {
+    return JSON.stringify(obj);
+  } catch {
+    return "[Unable to serialize output]";
+  }
+};
 
 export const registerPamAccountRouter = async (server: FastifyZodProvider) => {
   server.get(
@@ -52,7 +61,14 @@ export const registerPamAccountRouter = async (server: FastifyZodProvider) => {
     { websocket: true, onRequest: verifyAuth([AuthMode.JWT]) },
     async (connection, req) => {
       const { accountId } = req.params as { accountId: string };
-      const { sessionId } = req.query as { sessionId: string };
+      const { sessionId } = req.query as { sessionId?: string };
+
+      // Validate sessionId early
+      if (!sessionId || typeof sessionId !== "string") {
+        connection.socket.send(JSON.stringify({ error: "Missing or invalid sessionId parameter", type: "connection_error" }));
+        connection.socket.close(1008, "Missing sessionId");
+        return;
+      }
 
       // Connection state
       let dbClient: Knex | null = null;
@@ -90,7 +106,7 @@ export const registerPamAccountRouter = async (server: FastifyZodProvider) => {
           dbClient,
           proxyCleanup,
           sessionId,
-          commandLogs: commandLogs.slice(lastSavedIndex),
+          commandLogs: [], // Already saved by saveLogsIncrementally above
           actor: req.permission,
           auditLogInfo: req.auditLogInfo,
           orgId: req.permission.orgId
@@ -194,11 +210,16 @@ SQL queries - Execute any PostgreSQL SQL query`
 
             // Handle \dt command (list tables)
             if (trimmedCommand === "\\dt") {
+              if (!dbClient) {
+                connection.socket.send(JSON.stringify({ error: "Database connection not available", type: "error" }));
+                return;
+              }
+
               try {
-                const { rows, columns, rowCount } = await server.services.pamTerminal.listTables(dbClient!);
+                const { rows, columns, rowCount } = await server.services.pamTerminal.listTables(dbClient);
 
                 connection.socket.send(JSON.stringify({ type: "output", rows, columns, rowCount }));
-                commandLogs.push({ input: "\\dt", output: JSON.stringify({ rows, columns, rowCount }), timestamp: new Date() });
+                commandLogs.push({ input: "\\dt", output: safeStringify({ rows, columns, rowCount }), timestamp: new Date() });
 
                 if (commandLogs.length - lastSavedIndex >= INCREMENTAL_SAVE_BATCH_SIZE) {
                   await saveLogsIncrementally();
@@ -222,8 +243,13 @@ SQL queries - Execute any PostgreSQL SQL query`
             }
 
             // Execute SQL query
+            if (!dbClient) {
+              connection.socket.send(JSON.stringify({ error: "Database connection not available", type: "error" }));
+              return;
+            }
+
             try {
-              const result = await server.services.pamTerminal.executeSqlQuery(dbClient!, command, {
+              const result = await server.services.pamTerminal.executeSqlQuery(dbClient, command, {
                 maxRetryAttempts: MAX_RETRY_ATTEMPTS,
                 initialRetryDelayMs: INITIAL_RETRY_DELAY_MS,
                 onRetry: (attempt, error) => {
@@ -267,7 +293,7 @@ SQL queries - Execute any PostgreSQL SQL query`
 
               commandLogs.push({
                 input: command,
-                output: JSON.stringify({ rows: result.rows, columns: result.columns, rowCount: result.rowCount }),
+                output: safeStringify({ rows: result.rows, columns: result.columns, rowCount: result.rowCount }),
                 timestamp: new Date()
               });
 

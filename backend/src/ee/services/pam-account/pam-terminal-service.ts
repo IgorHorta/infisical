@@ -13,7 +13,6 @@ import {
   TSqlAccountCredentials,
   TSqlResourceConnectionDetails
 } from "@app/ee/services/pam-resource/shared/sql/sql-resource-types";
-import { TPamSessionDALFactory } from "@app/ee/services/pam-session/pam-session-dal";
 import { TPamSessionServiceFactory } from "@app/ee/services/pam-session/pam-session-service";
 import { TPamSessionCommandLog } from "@app/ee/services/pam-session/pam-session-types";
 import { BadRequestError, NotFoundError } from "@app/lib/errors";
@@ -24,7 +23,6 @@ import { OrgServiceActor } from "@app/lib/types";
 import { TKmsServiceFactory } from "@app/services/kms/kms-service";
 
 type TPamTerminalServiceFactoryDep = {
-  pamSessionDAL: TPamSessionDALFactory;
   pamAccountDAL: TPamAccountDALFactory;
   pamResourceDAL: TPamResourceDALFactory;
   pamSessionService: Pick<TPamSessionServiceFactory, "getById" | "appendLogsForUser" | "endSessionById">;
@@ -49,7 +47,6 @@ export type TTerminalConnection = {
  * Handles session validation, credential decryption, gateway proxy setup, and SQL query execution
  */
 export const pamTerminalServiceFactory = ({
-  pamSessionDAL,
   pamAccountDAL,
   pamResourceDAL,
   pamSessionService,
@@ -235,7 +232,7 @@ export const pamTerminalServiceFactory = ({
       onMaxRetriesExceeded?: (error: Error) => void;
     } = {}
   ) => {
-    const { maxRetryAttempts = 3, initialRetryDelayMs = 180000, onRetry, onMaxRetriesExceeded } = options;
+    const { maxRetryAttempts = 3, initialRetryDelayMs = 1000, onRetry, onMaxRetriesExceeded } = options;
 
     const executeWithRetry = async (
       attempt = 0
