@@ -59,6 +59,8 @@ export const registerPamAccountRouter = async (server: FastifyZodProvider) => {
       let proxyCleanup: (() => Promise<void>) | null = null;
       let sessionExpirationTimer: NodeJS.Timeout | null = null;
       let incrementalSaveTimer: NodeJS.Timeout | null = null;
+      let isCleanedUp = false;
+      let failedAttempts = 0;
       const commandLogs: TPamSessionCommandLog[] = [];
       let lastSavedIndex = 0;
 
@@ -75,6 +77,9 @@ export const registerPamAccountRouter = async (server: FastifyZodProvider) => {
       };
 
       const cleanup = async () => {
+        if (isCleanedUp) return;
+        isCleanedUp = true;
+
         if (sessionExpirationTimer) clearTimeout(sessionExpirationTimer);
         if (incrementalSaveTimer) clearInterval(incrementalSaveTimer);
         sessionExpirationTimer = null;
@@ -146,8 +151,6 @@ export const registerPamAccountRouter = async (server: FastifyZodProvider) => {
 
         // Handle SQL commands
         connection.socket.on("message", async (data) => {
-          let failedAttempts = 0;
-
           try {
             const message = JSON.parse(data.toString()) as { command?: string };
             const { command } = message;

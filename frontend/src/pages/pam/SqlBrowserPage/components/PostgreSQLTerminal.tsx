@@ -254,8 +254,9 @@ export const PostgreSQLTerminal = ({ accountId, sessionId }: Props) => {
 
       // Up arrow - navigate history
       if (data === "\x1b[A") {
+        if (commandHistory.length === 0) return;
         const newIndex = Math.min(historyIndex + 1, commandHistory.length - 1);
-        if (newIndex < commandHistory.length) {
+        if (newIndex >= 0 && newIndex < commandHistory.length) {
           historyIndex = newIndex;
           const cmd = commandHistory[commandHistory.length - 1 - newIndex];
           terminal.write(`\r${" ".repeat(currentLine.length + 12)}\rpostgres=# ${cmd}`);

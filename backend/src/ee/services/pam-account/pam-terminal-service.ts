@@ -120,11 +120,11 @@ export const pamTerminalServiceFactory = ({
       kmsService
     }) as TSqlAccountCredentials;
 
-    const connectionDetails = await decryptResourceConnectionDetails({
+    const connectionDetails = await decryptResourceConnectionDetails<TSqlResourceConnectionDetails>({
       encryptedConnectionDetails: resource.encryptedConnectionDetails,
       projectId: session.projectId,
       kmsService
-    }) as TSqlResourceConnectionDetails;
+    });
 
     // Step 4: Get gateway connection details
     const expiresAt = session.expiresAt || new Date(now.getTime() + 3600000);
@@ -200,8 +200,15 @@ export const pamTerminalServiceFactory = ({
       }
     });
 
-    // Test connection
-    await dbClient.raw("SELECT 1");
+    // Test connection - cleanup proxy if connection fails
+    try {
+      await dbClient.raw("SELECT 1");
+    } catch (err) {
+      // Cleanup proxy server if database connection test fails
+      await proxyServer.cleanup();
+      await dbClient.destroy();
+      throw err;
+    }
 
     logger.debug({ sessionId }, "PostgreSQL connection established");
 

@@ -42,7 +42,7 @@ export const encryptResourceConnectionDetails = async ({
   return encryptedConnectionDetailsBlob;
 };
 
-export const decryptResourceConnectionDetails = async ({
+export const decryptResourceConnectionDetails = async <T extends TPamResourceConnectionDetails = TPamResourceConnectionDetails>({
   projectId,
   encryptedConnectionDetails,
   kmsService
@@ -50,7 +50,7 @@ export const decryptResourceConnectionDetails = async ({
   projectId: string;
   encryptedConnectionDetails: Buffer;
   kmsService: Pick<TKmsServiceFactory, "createCipherPairWithDataKey">;
-}) => {
+}): Promise<T> => {
   const { decryptor } = await kmsService.createCipherPairWithDataKey({
     type: KmsDataKey.SecretManager,
     projectId
@@ -60,7 +60,7 @@ export const decryptResourceConnectionDetails = async ({
     cipherTextBlob: encryptedConnectionDetails
   });
 
-  return JSON.parse(decryptedPlainTextBlob.toString()) as TPamResourceConnectionDetails;
+  return JSON.parse(decryptedPlainTextBlob.toString()) as T;
 };
 
 // Resource Metadata

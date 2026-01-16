@@ -840,11 +840,11 @@ export const pamAccountServiceFactory = ({
       case PamResource.Postgres:
       case PamResource.MySQL:
         {
-          const connectionCredentials = (await decryptResourceConnectionDetails({
+          const connectionCredentials = await decryptResourceConnectionDetails<TSqlResourceConnectionDetails>({
             encryptedConnectionDetails: resource.encryptedConnectionDetails,
             kmsService,
             projectId
-          })) as TSqlResourceConnectionDetails;
+          });
 
           const credentials = (await decryptAccountCredentials({
             encryptedCredentials: account.encryptedCredentials,
