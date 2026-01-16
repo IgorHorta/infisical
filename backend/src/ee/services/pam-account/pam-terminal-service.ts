@@ -76,6 +76,11 @@ export const pamTerminalServiceFactory = ({
       throw new BadRequestError({ message: "Session does not match account" });
     }
 
+    // Verify session ownership - prevent session hijacking
+    if (session.userId !== actor.id) {
+      throw new BadRequestError({ message: "You do not have access to this session" });
+    }
+
     // Check session expiration
     const now = new Date();
     if (session.endedAt) {

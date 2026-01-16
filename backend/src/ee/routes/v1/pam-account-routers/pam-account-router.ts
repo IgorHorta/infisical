@@ -225,15 +225,20 @@ SQL queries - Execute any PostgreSQL SQL query`
                   await saveLogsIncrementally();
                 }
 
-                await server.services.auditLog.createAuditLog({
-                  ...req.auditLogInfo,
-                  orgId: req.permission.orgId,
-                  projectId: session.projectId,
-                  event: {
-                    type: EventType.PAM_SESSION_LOGS_UPDATE,
-                    metadata: { sessionId, accountName: session.accountName }
-                  }
-                });
+                // Audit log in separate try-catch to prevent audit failures from affecting command response
+                try {
+                  await server.services.auditLog.createAuditLog({
+                    ...req.auditLogInfo,
+                    orgId: req.permission.orgId,
+                    projectId: session.projectId,
+                    event: {
+                      type: EventType.PAM_SESSION_LOGS_UPDATE,
+                      metadata: { sessionId, accountName: session.accountName }
+                    }
+                  });
+                } catch (auditError) {
+                  logger.error({ err: auditError, sessionId }, "Failed to create audit log for \\dt command");
+                }
               } catch (err) {
                 connection.socket.send(
                   JSON.stringify({ type: "error", error: `Failed to list tables: ${err instanceof Error ? err.message : String(err)}` })
@@ -301,15 +306,20 @@ SQL queries - Execute any PostgreSQL SQL query`
                 await saveLogsIncrementally();
               }
 
-              await server.services.auditLog.createAuditLog({
-                ...req.auditLogInfo,
-                orgId: req.permission.orgId,
-                projectId: session.projectId,
-                event: {
-                  type: EventType.PAM_SESSION_LOGS_UPDATE,
-                  metadata: { sessionId, accountName: session.accountName }
-                }
-              });
+              // Audit log in separate try-catch to prevent audit failures from closing connection
+              try {
+                await server.services.auditLog.createAuditLog({
+                  ...req.auditLogInfo,
+                  orgId: req.permission.orgId,
+                  projectId: session.projectId,
+                  event: {
+                    type: EventType.PAM_SESSION_LOGS_UPDATE,
+                    metadata: { sessionId, accountName: session.accountName }
+                  }
+                });
+              } catch (auditError) {
+                logger.error({ err: auditError, sessionId }, "Failed to create audit log for SQL query");
+              }
 
               failedAttempts = 0;
             } catch (queryError) {

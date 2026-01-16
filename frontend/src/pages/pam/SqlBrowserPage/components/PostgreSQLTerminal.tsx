@@ -57,6 +57,8 @@ export const PostgreSQLTerminal = ({ accountId, sessionId }: Props) => {
   const wsRef = useRef<WebSocket | null>(null);
   const promptRef = useRef<string>(DEFAULT_PROMPT);
   const reconnectAttemptsRef = useRef<number>(0);
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const isMountedRef = useRef<boolean>(true);
   const [commandHistory, setCommandHistory] = useState<string[]>([]);
 
   const showPrompt = useCallback(() => {
@@ -179,7 +181,12 @@ export const PostgreSQLTerminal = ({ accountId, sessionId }: Props) => {
       reconnectAttemptsRef.current += 1;
       terminal.writeln(`Connection lost - reconnecting (attempt ${reconnectAttemptsRef.current}/${MAX_RECONNECT_ATTEMPTS})...`);
 
-      setTimeout(() => {
+      reconnectTimeoutRef.current = setTimeout(() => {
+        // Check if component is still mounted before creating new connection
+        if (!isMountedRef.current) {
+          return;
+        }
+
         if (!wsRef.current || wsRef.current.readyState === WebSocket.CLOSED) {
           const newWs = new WebSocket(buildWsUrl(accountId, sessionId, getToken()));
           newWs.onopen = () => {
@@ -209,6 +216,11 @@ export const PostgreSQLTerminal = ({ accountId, sessionId }: Props) => {
     window.addEventListener("resize", handleResize);
 
     return () => {
+      isMountedRef.current = false;
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = null;
+      }
       window.removeEventListener("resize", handleResize);
       terminal.dispose();
       wsRef.current?.close();
