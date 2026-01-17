@@ -46,15 +46,6 @@ const MAX_RETRY_ATTEMPTS = 3;
 const INITIAL_RETRY_DELAY_MS = 1000; // 1 second
 const MAX_COMMAND_LENGTH = 10000;
 
-// Safe JSON stringify that handles circular references and non-serializable data
-const safeStringify = (obj: unknown): string => {
-  try {
-    return JSON.stringify(obj);
-  } catch {
-    return "[Unable to serialize output]";
-  }
-};
-
 export const registerPamAccountRouter = async (server: FastifyZodProvider) => {
   server.get(
     "/:accountId/terminal",
@@ -219,7 +210,7 @@ SQL queries - Execute any PostgreSQL SQL query`
                 const { rows, columns, rowCount } = await server.services.pamTerminal.listTables(dbClient);
 
                 connection.socket.send(JSON.stringify({ type: "output", rows, columns, rowCount }));
-                commandLogs.push({ input: "\\dt", output: safeStringify({ rows, columns, rowCount }), timestamp: new Date() });
+                commandLogs.push({ input: "\\dt", output: JSON.stringify({ rows, columns, rowCount }), timestamp: new Date() });
 
                 if (commandLogs.length - lastSavedIndex >= INCREMENTAL_SAVE_BATCH_SIZE) {
                   await saveLogsIncrementally();
@@ -298,7 +289,7 @@ SQL queries - Execute any PostgreSQL SQL query`
 
               commandLogs.push({
                 input: command,
-                output: safeStringify({ rows: result.rows, columns: result.columns, rowCount: result.rowCount }),
+                output: JSON.stringify({ rows: result.rows, columns: result.columns, rowCount: result.rowCount }),
                 timestamp: new Date()
               });
 
