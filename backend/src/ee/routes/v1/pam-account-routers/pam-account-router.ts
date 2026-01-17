@@ -1,8 +1,10 @@
+import type { Knex } from "knex";
 import { z } from "zod";
 
 import { PamFoldersSchema } from "@app/db/schemas";
 import { EventType } from "@app/ee/services/audit-log/audit-log-types";
 import { PamAccountOrderBy, PamAccountView } from "@app/ee/services/pam-account/pam-account-enums";
+import { TTerminalCommandContext } from "@app/ee/services/pam-account/pam-terminal-service";
 import { SanitizedAwsIamAccountWithResourceSchema } from "@app/ee/services/pam-resource/aws-iam/aws-iam-resource-schemas";
 import { SanitizedKubernetesAccountWithResourceSchema } from "@app/ee/services/pam-resource/kubernetes/kubernetes-resource-schemas";
 import { SanitizedMySQLAccountWithResourceSchema } from "@app/ee/services/pam-resource/mysql/mysql-resource-schemas";
@@ -11,8 +13,10 @@ import { GatewayAccessResponseSchema } from "@app/ee/services/pam-resource/pam-r
 import { SanitizedPostgresAccountWithResourceSchema } from "@app/ee/services/pam-resource/postgres/postgres-resource-schemas";
 import { SanitizedRedisAccountWithResourceSchema } from "@app/ee/services/pam-resource/redis/redis-resource-schemas";
 import { SanitizedSSHAccountWithResourceSchema } from "@app/ee/services/pam-resource/ssh/ssh-resource-schemas";
+import { TPamSessionCommandLog } from "@app/ee/services/pam-session/pam-session-types";
 import { BadRequestError } from "@app/lib/errors";
 import { removeTrailingSlash } from "@app/lib/fn";
+import { logger } from "@app/lib/logger";
 import { ms } from "@app/lib/ms";
 import { OrderByDirection } from "@app/lib/types";
 import { readLimit, writeLimit } from "@app/server/config/rateLimiter";
@@ -36,7 +40,170 @@ const ListPamAccountsResponseSchema = z.object({
   folderPaths: z.record(z.string(), z.string())
 });
 
+const INCREMENTAL_SAVE_INTERVAL_MS = 30000;
+
+const sendJson = (socket: { send: (data: string) => void }, data: object) => {
+  socket.send(JSON.stringify(data));
+};
+
 export const registerPamAccountRouter = async (server: FastifyZodProvider) => {
+  const { TERMINAL_CONFIG } = server.services.pamTerminal;
+
+  server.get(
+    "/:accountId/terminal",
+    { websocket: true, onRequest: verifyAuth([AuthMode.JWT]) },
+    async (connection, req) => {
+      const { accountId } = req.params as { accountId: string };
+      const { sessionId } = req.query as { sessionId?: string };
+
+      // Validate sessionId
+      if (!sessionId || typeof sessionId !== "string") {
+        sendJson(connection.socket, { error: "Missing or invalid sessionId parameter", type: "connection_error" });
+        connection.socket.close(1008, "Missing sessionId");
+        return;
+      }
+
+      // Connection state
+      let dbClient: Knex | null = null;
+      let proxyCleanup: (() => Promise<void>) | null = null;
+      let sessionExpirationTimer: NodeJS.Timeout | null = null;
+      let incrementalSaveTimer: NodeJS.Timeout | null = null;
+      let isCleanedUp = false;
+      const commandLogs: TPamSessionCommandLog[] = [];
+      let lastSavedIndex = 0;
+
+      const saveLogsIncrementally = async () => {
+        const unsavedLogs = commandLogs.slice(lastSavedIndex);
+        if (unsavedLogs.length === 0) return;
+
+        try {
+          await server.services.pamSession.appendLogsForUser(sessionId, unsavedLogs, req.permission);
+          lastSavedIndex = commandLogs.length;
+        } catch (err) {
+          logger.error({ err, sessionId }, "Failed to save incremental logs");
+        }
+      };
+
+      const cleanup = async () => {
+        if (isCleanedUp) return;
+        isCleanedUp = true;
+
+        if (sessionExpirationTimer) clearTimeout(sessionExpirationTimer);
+        if (incrementalSaveTimer) clearInterval(incrementalSaveTimer);
+
+        await saveLogsIncrementally();
+        await server.services.pamTerminal.cleanupTerminalConnection({
+          dbClient,
+          proxyCleanup,
+          sessionId,
+          commandLogs: [],
+          actor: req.permission,
+          auditLogInfo: req.auditLogInfo,
+          orgId: req.permission.orgId
+        });
+      };
+
+      const sendErrorAndClose = async (errorMsg: string, closeCode = 1008) => {
+        try {
+          sendJson(connection.socket, { error: errorMsg, type: "connection_error" });
+        } catch {
+          // Ignore send errors
+        }
+        await cleanup();
+        connection.socket.close(closeCode, errorMsg);
+      };
+
+      try {
+        // Setup terminal connection
+        const terminalConnection = await server.services.pamTerminal
+          .setupTerminalConnection(sessionId, accountId, req.permission)
+          .catch(async (err) => {
+            logger.error({ err, sessionId }, "Terminal connection setup failed");
+            await sendErrorAndClose(err instanceof Error ? err.message : "Connection failed");
+            return null;
+          });
+
+        if (!terminalConnection) return;
+
+        dbClient = terminalConnection.dbClient;
+        proxyCleanup = terminalConnection.proxyCleanup;
+
+        const { session } = await server.services.pamSession.getById(sessionId, req.permission);
+
+        // Send connected message
+        sendJson(connection.socket, {
+          type: "connected",
+          message: "Connected to PostgreSQL database",
+          database: terminalConnection.connectionInfo.database,
+          username: terminalConnection.connectionInfo.username
+        });
+
+        // Setup session expiration timer
+        if (session.expiresAt) {
+          const expirationTime = session.expiresAt.getTime() - Date.now();
+          if (expirationTime > 0) {
+            const timerDelay = Math.max(expirationTime - 5000, 1000);
+            sessionExpirationTimer = setTimeout(() => sendErrorAndClose("Session expired", 1000), timerDelay);
+          }
+        }
+
+        // Setup incremental log saving
+        incrementalSaveTimer = setInterval(saveLogsIncrementally, INCREMENTAL_SAVE_INTERVAL_MS);
+
+        // Create command context
+        const commandCtx: TTerminalCommandContext = {
+          sessionId,
+          dbClient,
+          session,
+          commandLogs,
+          actor: req.permission,
+          auditLogInfo: req.auditLogInfo,
+          onLogsBatchReady: saveLogsIncrementally
+        };
+
+        // Handle incoming messages
+        connection.socket.on("message", async (data: Buffer) => {
+          try {
+            const message = JSON.parse(data.toString()) as { command?: string };
+            const { command } = message;
+
+            if (!command || typeof command !== "string") {
+              sendJson(connection.socket, { error: "Invalid command format", type: "error" });
+              return;
+            }
+
+            if (command.length > TERMINAL_CONFIG.MAX_COMMAND_LENGTH) {
+              sendJson(connection.socket, {
+                error: `Command too long (max ${TERMINAL_CONFIG.MAX_COMMAND_LENGTH} characters)`,
+                type: "error"
+              });
+              return;
+            }
+
+            const result = await server.services.pamTerminal.handleTerminalCommand(command, commandCtx);
+
+            sendJson(connection.socket, { type: result.type, ...result.data });
+
+            if (result.shouldClose) {
+              await cleanup();
+              connection.socket.close(result.closeCode || 1000, "Command requested close");
+            }
+          } catch {
+            sendJson(connection.socket, { error: "Invalid message format", type: "error" });
+          }
+        });
+
+        // Wire up lifecycle handlers
+        connection.socket.on("close", cleanup);
+        connection.socket.on("error", (err) => logger.error({ err, sessionId }, "WebSocket error"));
+        connection.socket.on("ping", () => connection.socket.pong());
+      } catch (err) {
+        logger.error({ err, sessionId }, "WebSocket handler error");
+        await sendErrorAndClose(err instanceof Error ? err.message : "Internal server error");
+      }
+    }
+  );
+
   server.route({
     method: "GET",
     url: "/",

@@ -29,9 +29,13 @@ import { TKmipServiceFactory } from "@app/ee/services/kmip/kmip-service";
 import { TLdapConfigServiceFactory } from "@app/ee/services/ldap-config/ldap-config-service";
 import { TLicenseServiceFactory } from "@app/ee/services/license/license-service";
 import { TOidcConfigServiceFactory } from "@app/ee/services/oidc/oidc-config-service";
+import { TPamAccountDALFactory } from "@app/ee/services/pam-account/pam-account-dal";
 import { TPamAccountServiceFactory } from "@app/ee/services/pam-account/pam-account-service";
+import { TPamTerminalServiceFactory } from "@app/ee/services/pam-account/pam-terminal-service";
 import { TPamFolderServiceFactory } from "@app/ee/services/pam-folder/pam-folder-service";
+import { TPamResourceDALFactory } from "@app/ee/services/pam-resource/pam-resource-dal";
 import { TPamResourceServiceFactory } from "@app/ee/services/pam-resource/pam-resource-service";
+import { TPamSessionDALFactory } from "@app/ee/services/pam-session/pam-session-dal";
 import { TPamSessionServiceFactory } from "@app/ee/services/pam-session/pam-session-service";
 import { TPermissionServiceFactory } from "@app/ee/services/permission/permission-service-types";
 import { TPitServiceFactory } from "@app/ee/services/pit/pit-service";
@@ -358,8 +362,13 @@ declare module "fastify" {
       pamResource: TPamResourceServiceFactory;
       pamAccount: TPamAccountServiceFactory;
       pamSession: TPamSessionServiceFactory;
+      pamTerminal: TPamTerminalServiceFactory;
       mfaSession: TMfaSessionServiceFactory;
       upgradePath: TUpgradePathService;
+      kmsService: TKmsServiceFactory;
+      pamAccountDAL: TPamAccountDALFactory;
+      pamResourceDAL: TPamResourceDALFactory;
+      pamSessionDAL: TPamSessionDALFactory;
 
       membershipUser: TMembershipUserServiceFactory;
       membershipIdentity: TMembershipIdentityServiceFactory;

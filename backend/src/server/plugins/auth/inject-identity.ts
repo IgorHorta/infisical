@@ -75,7 +75,19 @@ export const extractAuth = async (req: FastifyRequest, jwtSecret: string) => {
   if (apiKey) {
     return { authMode: AuthMode.API_KEY, token: apiKey, actor: ActorType.USER } as const;
   }
-  const authHeader = req.headers?.authorization;
+  
+  // Check Authorization header first (standard for HTTP requests)
+  let authHeader = req.headers?.authorization;
+  
+  // For WebSocket connections, browsers can't send custom headers, so check query parameter as fallback
+  if (!authHeader && req.url) {
+    const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    const tokenParam = url.searchParams.get("token");
+    if (tokenParam) {
+      authHeader = `Bearer ${tokenParam}`;
+    }
+  }
+  
   if (!authHeader) return { authMode: null, token: null };
 
   const authTokenValue = authHeader.slice(7); // slice of after Bearer

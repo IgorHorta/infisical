@@ -9,12 +9,13 @@ import { TKmsServiceFactory } from "@app/services/kms/kms-service";
 import { KmsDataKey } from "@app/services/kms/kms-types";
 import { TProjectDALFactory } from "@app/services/project/project-dal";
 
+import { logger } from "@app/lib/logger";
 import { OrgPermissionGatewayActions, OrgPermissionSubjects } from "../permission/org-permission";
 import { ProjectPermissionPamSessionActions, ProjectPermissionSub } from "../permission/project-permission";
 import { TPamSessionDALFactory } from "./pam-session-dal";
 import { PamSessionStatus } from "./pam-session-enums";
-import { decryptSession } from "./pam-session-fns";
-import { TUpdateSessionLogsDTO } from "./pam-session-types";
+import { appendSessionLogsForUser, decryptSession } from "./pam-session-fns";
+import { TUpdateSessionLogsDTO, TPamSessionCommandLog } from "./pam-session-types";
 
 type TPamSessionServiceFactoryDep = {
   pamSessionDAL: TPamSessionDALFactory;
@@ -157,6 +158,46 @@ export const pamSessionServiceFactory = ({
     return { session: updatedSession, projectId: project.id };
   };
 
+  /**
+   * Append logs incrementally to a session, merging with existing logs if any
+   */
+  const appendLogsForUser = async (sessionId: string, logs: TPamSessionCommandLog[], actor: OrgServiceActor) => {
+    if (logs.length === 0) return;
+
+    const session = await pamSessionDAL.findById(sessionId);
+    if (!session) {
+      logger.warn({ sessionId }, "Session not found, skipping log storage");
+      return;
+    }
+
+    if (session.userId !== actor.id) {
+      logger.warn({ sessionId }, "User does not own session, skipping log storage");
+      return;
+    }
+
+    const { permission } = await permissionService.getProjectPermission({
+      actor: actor.type,
+      actorAuthMethod: actor.authMethod,
+      actorId: actor.id,
+      actorOrgId: actor.orgId,
+      projectId: session.projectId,
+      actionProjectType: ActionProjectType.PAM
+    });
+
+    ForbiddenError.from(permission).throwUnlessCan(
+      ProjectPermissionPamSessionActions.Read,
+      ProjectPermissionSub.PamSessions
+    );
+
+    await appendSessionLogsForUser({
+      sessionId,
+      logs,
+      userId: actor.id,
+      pamSessionDAL,
+      kmsService
+    });
+  };
+
   const endSessionById = async (sessionId: string, actor: OrgServiceActor) => {
     const session = await pamSessionDAL.findById(sessionId);
     if (!session) throw new NotFoundError({ message: `Session with ID '${sessionId}' not found` });
@@ -209,5 +250,5 @@ export const pamSessionServiceFactory = ({
     return { session: updatedSession, projectId: project.id };
   };
 
-  return { getById, list, updateLogsById, endSessionById };
+  return { getById, list, updateLogsById, appendLogsForUser, endSessionById };
 };
