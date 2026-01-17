@@ -4,6 +4,7 @@ import { z } from "zod";
 import { PamFoldersSchema } from "@app/db/schemas";
 import { EventType } from "@app/ee/services/audit-log/audit-log-types";
 import { PamAccountOrderBy, PamAccountView } from "@app/ee/services/pam-account/pam-account-enums";
+import { TTerminalCommandContext } from "@app/ee/services/pam-account/pam-terminal-service";
 import { SanitizedAwsIamAccountWithResourceSchema } from "@app/ee/services/pam-resource/aws-iam/aws-iam-resource-schemas";
 import { SanitizedKubernetesAccountWithResourceSchema } from "@app/ee/services/pam-resource/kubernetes/kubernetes-resource-schemas";
 import { SanitizedMySQLAccountWithResourceSchema } from "@app/ee/services/pam-resource/mysql/mysql-resource-schemas";
@@ -39,14 +40,15 @@ const ListPamAccountsResponseSchema = z.object({
   folderPaths: z.record(z.string(), z.string())
 });
 
-// Constants for incremental log persistence
-const INCREMENTAL_SAVE_BATCH_SIZE = 10;
 const INCREMENTAL_SAVE_INTERVAL_MS = 30000;
-const MAX_RETRY_ATTEMPTS = 3;
-const INITIAL_RETRY_DELAY_MS = 1000; // 1 second
-const MAX_COMMAND_LENGTH = 10000;
+
+const sendJson = (socket: { send: (data: string) => void }, data: object) => {
+  socket.send(JSON.stringify(data));
+};
 
 export const registerPamAccountRouter = async (server: FastifyZodProvider) => {
+  const { TERMINAL_CONFIG } = server.services.pamTerminal;
+
   server.get(
     "/:accountId/terminal",
     { websocket: true, onRequest: verifyAuth([AuthMode.JWT]) },
@@ -54,9 +56,9 @@ export const registerPamAccountRouter = async (server: FastifyZodProvider) => {
       const { accountId } = req.params as { accountId: string };
       const { sessionId } = req.query as { sessionId?: string };
 
-      // Validate sessionId early
+      // Validate sessionId
       if (!sessionId || typeof sessionId !== "string") {
-        connection.socket.send(JSON.stringify({ error: "Missing or invalid sessionId parameter", type: "connection_error" }));
+        sendJson(connection.socket, { error: "Missing or invalid sessionId parameter", type: "connection_error" });
         connection.socket.close(1008, "Missing sessionId");
         return;
       }
@@ -67,7 +69,6 @@ export const registerPamAccountRouter = async (server: FastifyZodProvider) => {
       let sessionExpirationTimer: NodeJS.Timeout | null = null;
       let incrementalSaveTimer: NodeJS.Timeout | null = null;
       let isCleanedUp = false;
-      let failedAttempts = 0;
       const commandLogs: TPamSessionCommandLog[] = [];
       let lastSavedIndex = 0;
 
@@ -89,15 +90,13 @@ export const registerPamAccountRouter = async (server: FastifyZodProvider) => {
 
         if (sessionExpirationTimer) clearTimeout(sessionExpirationTimer);
         if (incrementalSaveTimer) clearInterval(incrementalSaveTimer);
-        sessionExpirationTimer = null;
-        incrementalSaveTimer = null;
 
         await saveLogsIncrementally();
         await server.services.pamTerminal.cleanupTerminalConnection({
           dbClient,
           proxyCleanup,
           sessionId,
-          commandLogs: [], // Already saved by saveLogsIncrementally above
+          commandLogs: [],
           actor: req.permission,
           auditLogInfo: req.auditLogInfo,
           orgId: req.permission.orgId
@@ -106,7 +105,7 @@ export const registerPamAccountRouter = async (server: FastifyZodProvider) => {
 
       const sendErrorAndClose = async (errorMsg: string, closeCode = 1008) => {
         try {
-          connection.socket.send(JSON.stringify({ error: errorMsg, type: "connection_error" }));
+          sendJson(connection.socket, { error: errorMsg, type: "connection_error" });
         } catch {
           // Ignore send errors
         }
@@ -116,223 +115,85 @@ export const registerPamAccountRouter = async (server: FastifyZodProvider) => {
 
       try {
         // Setup terminal connection
-        let terminalConnection;
-        try {
-          terminalConnection = await server.services.pamTerminal.setupTerminalConnection(
-            sessionId,
-            accountId,
-            req.permission
-          );
-          dbClient = terminalConnection.dbClient;
-          proxyCleanup = terminalConnection.proxyCleanup;
-        } catch (err) {
-          logger.error({ err, sessionId }, "Terminal connection setup failed");
-          await sendErrorAndClose(err instanceof Error ? err.message : "Connection failed");
-          return;
-        }
+        const terminalConnection = await server.services.pamTerminal
+          .setupTerminalConnection(sessionId, accountId, req.permission)
+          .catch(async (err) => {
+            logger.error({ err, sessionId }, "Terminal connection setup failed");
+            await sendErrorAndClose(err instanceof Error ? err.message : "Connection failed");
+            return null;
+          });
+
+        if (!terminalConnection) return;
+
+        dbClient = terminalConnection.dbClient;
+        proxyCleanup = terminalConnection.proxyCleanup;
 
         const { session } = await server.services.pamSession.getById(sessionId, req.permission);
 
-        connection.socket.send(
-          JSON.stringify({
-            type: "connected",
-            message: "Connected to PostgreSQL database",
-            database: terminalConnection.connectionInfo.database,
-            username: terminalConnection.connectionInfo.username
-          })
-        );
+        // Send connected message
+        sendJson(connection.socket, {
+          type: "connected",
+          message: "Connected to PostgreSQL database",
+          database: terminalConnection.connectionInfo.database,
+          username: terminalConnection.connectionInfo.username
+        });
 
-        // Session expiration timer
+        // Setup session expiration timer
         if (session.expiresAt) {
           const expirationTime = session.expiresAt.getTime() - Date.now();
           if (expirationTime > 0) {
             const timerDelay = Math.max(expirationTime - 5000, 1000);
-            sessionExpirationTimer = setTimeout(async () => {
-              await sendErrorAndClose("Session expired", 1000);
-            }, timerDelay);
+            sessionExpirationTimer = setTimeout(() => sendErrorAndClose("Session expired", 1000), timerDelay);
           }
         }
 
-        // Incremental log saving timer
+        // Setup incremental log saving
         incrementalSaveTimer = setInterval(saveLogsIncrementally, INCREMENTAL_SAVE_INTERVAL_MS);
 
-        // Handle SQL commands
-        connection.socket.on("message", async (data) => {
+        // Create command context
+        const commandCtx: TTerminalCommandContext = {
+          sessionId,
+          dbClient,
+          session,
+          commandLogs,
+          actor: req.permission,
+          auditLogInfo: req.auditLogInfo,
+          onLogsBatchReady: saveLogsIncrementally
+        };
+
+        // Handle incoming messages
+        connection.socket.on("message", async (data: Buffer) => {
           try {
             const message = JSON.parse(data.toString()) as { command?: string };
             const { command } = message;
 
             if (!command || typeof command !== "string") {
-              connection.socket.send(JSON.stringify({ error: "Invalid command format", type: "error" }));
+              sendJson(connection.socket, { error: "Invalid command format", type: "error" });
               return;
             }
 
-            if (command.length > MAX_COMMAND_LENGTH) {
-              connection.socket.send(
-                JSON.stringify({ error: `Command too long (max ${MAX_COMMAND_LENGTH} characters)`, type: "error" })
-              );
+            if (command.length > TERMINAL_CONFIG.MAX_COMMAND_LENGTH) {
+              sendJson(connection.socket, {
+                error: `Command too long (max ${TERMINAL_CONFIG.MAX_COMMAND_LENGTH} characters)`,
+                type: "error"
+              });
               return;
             }
 
-            const trimmedCommand = command.trim().toLowerCase();
+            const result = await server.services.pamTerminal.handleTerminalCommand(command, commandCtx);
 
-            // Handle exit commands
-            if (["\\q", "quit", "exit"].includes(trimmedCommand)) {
-              connection.socket.send(JSON.stringify({ type: "exit", message: "Connection closed by user" }));
+            sendJson(connection.socket, { type: result.type, ...result.data });
+
+            if (result.shouldClose) {
               await cleanup();
-              connection.socket.close(1000, "User requested disconnect");
-              return;
+              connection.socket.close(result.closeCode || 1000, "Command requested close");
             }
-
-            // Handle help command
-            if (["help", "\\h"].includes(trimmedCommand)) {
-              connection.socket.send(
-                JSON.stringify({
-                  type: "output",
-                  output: `Available commands:
-\\h or help - Show this help message
-\\q or quit - Close connection
-\\dt - List tables
-SQL queries - Execute any PostgreSQL SQL query`
-                })
-              );
-              return;
-            }
-
-            // Handle \dt command (list tables)
-            if (trimmedCommand === "\\dt") {
-              if (!dbClient) {
-                connection.socket.send(JSON.stringify({ error: "Database connection not available", type: "error" }));
-                return;
-              }
-
-              try {
-                const { rows, columns, rowCount } = await server.services.pamTerminal.listTables(dbClient);
-
-                connection.socket.send(JSON.stringify({ type: "output", rows, columns, rowCount }));
-                commandLogs.push({ input: "\\dt", output: JSON.stringify({ rows, columns, rowCount }), timestamp: new Date() });
-
-                if (commandLogs.length - lastSavedIndex >= INCREMENTAL_SAVE_BATCH_SIZE) {
-                  await saveLogsIncrementally();
-                }
-
-                // Audit log in separate try-catch to prevent audit failures from affecting command response
-                try {
-                  await server.services.auditLog.createAuditLog({
-                    ...req.auditLogInfo,
-                    orgId: req.permission.orgId,
-                    projectId: session.projectId,
-                    event: {
-                      type: EventType.PAM_SESSION_LOGS_UPDATE,
-                      metadata: { sessionId, accountName: session.accountName }
-                    }
-                  });
-                } catch (auditError) {
-                  logger.error({ err: auditError, sessionId }, "Failed to create audit log for \\dt command");
-                }
-              } catch (err) {
-                connection.socket.send(
-                  JSON.stringify({ type: "error", error: `Failed to list tables: ${err instanceof Error ? err.message : String(err)}` })
-                );
-              }
-              return;
-            }
-
-            // Execute SQL query
-            if (!dbClient) {
-              connection.socket.send(JSON.stringify({ error: "Database connection not available", type: "error" }));
-              return;
-            }
-
-            try {
-              const result = await server.services.pamTerminal.executeSqlQuery(dbClient, command, {
-                maxRetryAttempts: MAX_RETRY_ATTEMPTS,
-                initialRetryDelayMs: INITIAL_RETRY_DELAY_MS,
-                onRetry: (attempt, error) => {
-                  const retryDelay = INITIAL_RETRY_DELAY_MS * Math.pow(2, attempt - 1);
-                  connection.socket.send(
-                    JSON.stringify({
-                      type: "error",
-                      error: error.message,
-                      retryAttempt: attempt,
-                      maxRetries: MAX_RETRY_ATTEMPTS,
-                      nextRetryDelay: retryDelay
-                    })
-                  );
-                  commandLogs.push({
-                    input: command,
-                    output: `ERROR (Attempt ${attempt}/${MAX_RETRY_ATTEMPTS}): ${error.message}`,
-                    timestamp: new Date()
-                  });
-                },
-                onMaxRetriesExceeded: (error) => {
-                  connection.socket.send(
-                    JSON.stringify({
-                      type: "error",
-                      error: `Query failed after ${MAX_RETRY_ATTEMPTS} attempts`,
-                      connectionClosing: true
-                    })
-                  );
-                  commandLogs.push({ input: command, output: `ERROR: ${error.message}`, timestamp: new Date() });
-                }
-              });
-
-              connection.socket.send(
-                JSON.stringify({
-                  type: "output",
-                  rows: result.rows,
-                  columns: result.columns,
-                  rowCount: result.rowCount,
-                  executionTime: result.executionTime
-                })
-              );
-
-              commandLogs.push({
-                input: command,
-                output: JSON.stringify({ rows: result.rows, columns: result.columns, rowCount: result.rowCount }),
-                timestamp: new Date()
-              });
-
-              if (commandLogs.length - lastSavedIndex >= INCREMENTAL_SAVE_BATCH_SIZE) {
-                await saveLogsIncrementally();
-              }
-
-              // Audit log in separate try-catch to prevent audit failures from closing connection
-              try {
-                await server.services.auditLog.createAuditLog({
-                  ...req.auditLogInfo,
-                  orgId: req.permission.orgId,
-                  projectId: session.projectId,
-                  event: {
-                    type: EventType.PAM_SESSION_LOGS_UPDATE,
-                    metadata: { sessionId, accountName: session.accountName }
-                  }
-                });
-              } catch (auditError) {
-                logger.error({ err: auditError, sessionId }, "Failed to create audit log for SQL query");
-              }
-
-              failedAttempts = 0;
-            } catch (queryError) {
-              failedAttempts++;
-              if (failedAttempts >= MAX_RETRY_ATTEMPTS) {
-                if (dbClient) {
-                  try {
-                    await dbClient.destroy();
-                  } catch {
-                    // Ignore destroy errors
-                  }
-                }
-                await cleanup();
-                connection.socket.close(1008, "Max retry attempts exceeded");
-              }
-            }
-          } catch (parseError) {
-            connection.socket.send(JSON.stringify({ error: "Invalid message format", type: "error" }));
+          } catch {
+            sendJson(connection.socket, { error: "Invalid message format", type: "error" });
           }
         });
 
-        // Cleanup on close
+        // Wire up lifecycle handlers
         connection.socket.on("close", cleanup);
         connection.socket.on("error", (err) => logger.error({ err, sessionId }, "WebSocket error"));
         connection.socket.on("ping", () => connection.socket.pong());

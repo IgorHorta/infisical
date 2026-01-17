@@ -14,7 +14,7 @@ import {
   TSqlResourceConnectionDetails
 } from "@app/ee/services/pam-resource/shared/sql/sql-resource-types";
 import { TPamSessionServiceFactory } from "@app/ee/services/pam-session/pam-session-service";
-import { TPamSessionCommandLog } from "@app/ee/services/pam-session/pam-session-types";
+import { TPamSanitizedSession, TPamSessionCommandLog } from "@app/ee/services/pam-session/pam-session-types";
 import { BadRequestError, NotFoundError } from "@app/lib/errors";
 import { GatewayProxyProtocol } from "@app/lib/gateway";
 import { setupRelayServer } from "@app/lib/gateway-v2/gateway-v2";
@@ -41,6 +41,37 @@ export type TTerminalConnection = {
     username: string;
   };
 };
+
+// Command handling types
+export type TTerminalCommandResult = {
+  type: "output" | "error" | "exit";
+  data?: object;
+  shouldClose?: boolean;
+  closeCode?: number;
+};
+
+export type TTerminalCommandContext = {
+  sessionId: string;
+  dbClient: Knex;
+  session: TPamSanitizedSession;
+  commandLogs: TPamSessionCommandLog[];
+  actor: OrgServiceActor;
+  auditLogInfo: AuditLogInfo;
+  onLogsBatchReady: () => Promise<void>;
+};
+
+const TERMINAL_CONFIG = {
+  MAX_RETRY_ATTEMPTS: 3,
+  INITIAL_RETRY_DELAY_MS: 1000,
+  INCREMENTAL_SAVE_BATCH_SIZE: 10,
+  MAX_COMMAND_LENGTH: 10000
+} as const;
+
+const HELP_MESSAGE = `Available commands:
+\\h or help - Show this help message
+\\q or quit - Close connection
+\\dt - List tables
+SQL queries - Execute any PostgreSQL SQL query`;
 
 /**
  * Service for managing PostgreSQL terminal connections via WebSocket
@@ -357,10 +388,138 @@ export const pamTerminalServiceFactory = ({
     }
   };
 
+  /**
+   * Handle a terminal command and return the result
+   */
+  const handleTerminalCommand = async (
+    command: string,
+    ctx: TTerminalCommandContext
+  ): Promise<TTerminalCommandResult> => {
+    const trimmedCommand = command.trim().toLowerCase();
+
+    // Exit command
+    if (["\\q", "quit", "exit"].includes(trimmedCommand)) {
+      return {
+        type: "exit",
+        data: { message: "Connection closed by user" },
+        shouldClose: true,
+        closeCode: 1000
+      };
+    }
+
+    // Help command
+    if (["help", "\\h"].includes(trimmedCommand)) {
+      return {
+        type: "output",
+        data: { output: HELP_MESSAGE }
+      };
+    }
+
+    // List tables command
+    if (trimmedCommand === "\\dt") {
+      try {
+        const result = await listTables(ctx.dbClient);
+
+        ctx.commandLogs.push({
+          input: "\\dt",
+          output: JSON.stringify(result),
+          timestamp: new Date()
+        });
+
+        if (ctx.commandLogs.length % TERMINAL_CONFIG.INCREMENTAL_SAVE_BATCH_SIZE === 0) {
+          await ctx.onLogsBatchReady();
+        }
+
+        await createAuditLogSafely(ctx, "\\dt command");
+
+        return { type: "output", data: result };
+      } catch (err) {
+        return {
+          type: "error",
+          data: { error: `Failed to list tables: ${err instanceof Error ? err.message : String(err)}` }
+        };
+      }
+    }
+
+    // SQL query (default)
+    return executeSqlCommand(command, ctx);
+  };
+
+  const executeSqlCommand = async (
+    command: string,
+    ctx: TTerminalCommandContext
+  ): Promise<TTerminalCommandResult> => {
+    try {
+      const result = await executeSqlQuery(ctx.dbClient, command, {
+        maxRetryAttempts: TERMINAL_CONFIG.MAX_RETRY_ATTEMPTS,
+        initialRetryDelayMs: TERMINAL_CONFIG.INITIAL_RETRY_DELAY_MS,
+        onRetry: (attempt, error) => {
+          ctx.commandLogs.push({
+            input: command,
+            output: `ERROR (Attempt ${attempt}/${TERMINAL_CONFIG.MAX_RETRY_ATTEMPTS}): ${error.message}`,
+            timestamp: new Date()
+          });
+        },
+        onMaxRetriesExceeded: (error) => {
+          ctx.commandLogs.push({
+            input: command,
+            output: `ERROR: ${error.message}`,
+            timestamp: new Date()
+          });
+        }
+      });
+
+      ctx.commandLogs.push({
+        input: command,
+        output: JSON.stringify({ rows: result.rows, columns: result.columns, rowCount: result.rowCount }),
+        timestamp: new Date()
+      });
+
+      if (ctx.commandLogs.length % TERMINAL_CONFIG.INCREMENTAL_SAVE_BATCH_SIZE === 0) {
+        await ctx.onLogsBatchReady();
+      }
+
+      await createAuditLogSafely(ctx, "SQL query");
+
+      return {
+        type: "output",
+        data: {
+          rows: result.rows,
+          columns: result.columns,
+          rowCount: result.rowCount,
+          executionTime: result.executionTime
+        }
+      };
+    } catch (err) {
+      return {
+        type: "error",
+        data: { error: err instanceof Error ? err.message : String(err) }
+      };
+    }
+  };
+
+  const createAuditLogSafely = async (ctx: TTerminalCommandContext, commandType: string) => {
+    try {
+      await auditLogService.createAuditLog({
+        ...ctx.auditLogInfo,
+        orgId: ctx.actor.orgId,
+        projectId: ctx.session.projectId,
+        event: {
+          type: EventType.PAM_SESSION_LOGS_UPDATE,
+          metadata: { sessionId: ctx.sessionId, accountName: ctx.session.accountName }
+        }
+      });
+    } catch (err) {
+      logger.error({ err, sessionId: ctx.sessionId }, `Failed to create audit log for ${commandType}`);
+    }
+  };
+
   return {
     setupTerminalConnection,
     executeSqlQuery,
     listTables,
-    cleanupTerminalConnection
+    cleanupTerminalConnection,
+    handleTerminalCommand,
+    TERMINAL_CONFIG
   };
 };
